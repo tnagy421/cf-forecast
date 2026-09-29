@@ -41,130 +41,77 @@ class CashFlowPredictor:
         self.today = today or datetime.now()
         logger.info(f"CashFlowPredictor initialized. Today: {self.today.date()}")
 
+    COL_DUE_DATE_IDX = 13     # "Dátum splatnosti"
+    COL_INVOICE_AMOUNT_IDX = 23  # "Fakturovná suma"
+    COL_DIFFERENCE_IDX = 29   # "Rozdiel" (unpaid remainder)
+    EMPTY_COLS = ['company_name', 'due_date', 'amount', 'days_until_due']
+
+    def _find_col(self, raw_data: pd.DataFrame, label: str, default: int) -> int:
+        """Locate a column by its header text (fallback: default index)."""
+        for c in raw_data.columns:
+            col = raw_data[c].astype(str).str.strip()
+            if (col == label).any():
+                return c
+        return default
+
+    def _parse_export(self, raw_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Parse the accounting export (Nevyrovnané pohľadávky / záväzky).
+
+        Layout: a row with only the company name in column A, followed by that
+        company's invoice rows (column A empty), then a subtotal row (no due
+        date). Header rows are repeated on every page ("Pokračovanie").
+        """
+        due_c = self._find_col(raw_data, 'Dátum splatnosti', self.COL_DUE_DATE_IDX)
+        diff_c = self._find_col(raw_data, 'Rozdiel', self.COL_DIFFERENCE_IDX)
+        amt_c = self._find_col(raw_data, 'Fakturovná suma', self.COL_INVOICE_AMOUNT_IDX)
+
+        df = pd.DataFrame({
+            'company_name': raw_data.iloc[:, 0],
+            'due_date': pd.to_datetime(raw_data[due_c], errors='coerce'),
+            'invoice_amount': pd.to_numeric(raw_data[amt_c], errors='coerce'),
+            'unpaid_amount': pd.to_numeric(raw_data[diff_c], errors='coerce'),
+        })
+        # Company name appears only on its own header row -> carry it down
+        df['company_name'] = df['company_name'].ffill()
+        # Real invoice rows have a valid due date and an unpaid amount
+        df = df.dropna(subset=['due_date', 'unpaid_amount'])
+        df = df[df['unpaid_amount'] > 0].copy()
+        df['days_until_due'] = (df['due_date'].dt.normalize() - pd.Timestamp(self.today).normalize()).dt.days
+        return df
+
     def extract_payables(self, raw_data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract unpaid payables from Excel data.
-
-        A payable is unpaid if column 26 (Rozdiel) > 0.
-        No age filtering is applied to payables.
-
-        Args:
-            raw_data: Raw DataFrame from Excel export
-
-        Returns:
-            DataFrame with columns: company_name, due_date, amount, days_until_due
-        """
+        """Unpaid payables: Rozdiel > 0, no age filtering (overdue go to week 1)."""
         logger.info("Extracting payables...")
-
         try:
-            # Ensure we have enough columns
-            if raw_data.shape[1] < 26:
-                logger.warning(f"Expected at least 26 columns, got {raw_data.shape[1]}")
-                return pd.DataFrame(columns=['company_name', 'due_date', 'amount', 'days_until_due'])
-
-            # Extract relevant columns
-            df = raw_data.iloc[:, [self.COL_COMPANY_NAME, self.COL_DUE_DATE,
-                                   self.COL_INVOICE_AMOUNT, self.COL_DIFFERENCE]].copy()
-            df.columns = ['company_name', 'due_date', 'invoice_amount', 'unpaid_amount']
-
-            # Remove rows with missing critical data
-            df = df.dropna(subset=['due_date', 'unpaid_amount'])
-
-            # Convert data types
-            try:
-                df['due_date'] = pd.to_datetime(df['due_date'], errors='coerce')
-                df['unpaid_amount'] = pd.to_numeric(df['unpaid_amount'], errors='coerce')
-            except Exception as e:
-                logger.error(f"Error converting data types: {e}")
-                return pd.DataFrame(columns=['company_name', 'due_date', 'amount', 'days_until_due'])
-
-            # Filter: unpaid amount > 0 (meaning there's still something owed)
-            df = df[df['unpaid_amount'] > 0].copy()
-
-            # Calculate days until due date
-            df['days_until_due'] = (df['due_date'] - self.today).dt.days
-
-            # Rename amount column to standard name
-            df.rename(columns={'unpaid_amount': 'amount'}, inplace=True)
-
-            # Keep only needed columns
-            df = df[['company_name', 'due_date', 'amount', 'days_until_due']]
-
+            df = self._parse_export(raw_data)
+            df = df.rename(columns={'unpaid_amount': 'amount'})[self.EMPTY_COLS]
             logger.info(f"Extracted {len(df)} payable items")
             return df
-
         except Exception as e:
             logger.error(f"Error extracting payables: {e}")
-            return pd.DataFrame(columns=['company_name', 'due_date', 'amount', 'days_until_due'])
+            return pd.DataFrame(columns=self.EMPTY_COLS)
 
     def extract_receivables(self, raw_data: pd.DataFrame) -> pd.DataFrame:
         """
-        Extract unpaid receivables from Excel data.
+        Unpaid receivables: Rozdiel > 0.
 
-        A receivable is unpaid if column 26 (Rozdiel) > 0.
-
-        FILTERING RULE (2026-09-25):
-        - Exclude receivables where (due_date - today) > 70 days (old items)
-        - Include receivables where 0 <= (due_date - today) <= 69 days
-        - These included items are routed to Week 1 regardless of actual due date
-
-        Args:
-            raw_data: Raw DataFrame from Excel export
-
-        Returns:
-            DataFrame with columns: company_name, due_date, amount, days_until_due
+        Rule: drop receivables overdue by 70+ days (uncollectable). Items
+        overdue 0-69 days are kept and land in week 1; not-yet-due items go
+        to the week of their due date.
         """
         logger.info("Extracting receivables...")
-
         try:
-            # Ensure we have enough columns
-            if raw_data.shape[1] < 26:
-                logger.warning(f"Expected at least 26 columns, got {raw_data.shape[1]}")
-                return pd.DataFrame(columns=['company_name', 'due_date', 'amount', 'days_until_due'])
-
-            # Extract relevant columns
-            df = raw_data.iloc[:, [self.COL_COMPANY_NAME, self.COL_DUE_DATE,
-                                   self.COL_INVOICE_AMOUNT, self.COL_DIFFERENCE]].copy()
-            df.columns = ['company_name', 'due_date', 'invoice_amount', 'unpaid_amount']
-
-            # Remove rows with missing critical data
-            df = df.dropna(subset=['due_date', 'unpaid_amount'])
-
-            # Convert data types
-            try:
-                df['due_date'] = pd.to_datetime(df['due_date'], errors='coerce')
-                df['unpaid_amount'] = pd.to_numeric(df['unpaid_amount'], errors='coerce')
-            except Exception as e:
-                logger.error(f"Error converting data types: {e}")
-                return pd.DataFrame(columns=['company_name', 'due_date', 'amount', 'days_until_due'])
-
-            # Filter: unpaid amount > 0 (meaning there's still something owed)
-            df = df[df['unpaid_amount'] > 0].copy()
-
-            # Calculate days until due date
-            df['days_until_due'] = (df['due_date'] - self.today).dt.days
-
-            # APPLY 70-DAY THRESHOLD FOR RECEIVABLES ONLY
-            # Exclude items that are > 70 days past due or > 70 days in the future
-            initial_count = len(df)
-            df = df[df['days_until_due'] <= 69].copy()
-            excluded_count = initial_count - len(df)
-
-            if excluded_count > 0:
-                logger.info(f"Excluded {excluded_count} receivables older than 70 days")
-
-            # Rename amount column to standard name
-            df.rename(columns={'unpaid_amount': 'amount'}, inplace=True)
-
-            # Keep only needed columns
-            df = df[['company_name', 'due_date', 'amount', 'days_until_due']]
-
+            df = self._parse_export(raw_data)
+            before = len(df)
+            df = df[df['days_until_due'] > -70].copy()
+            logger.info(f"Excluded {before - len(df)} receivables overdue 70+ days")
+            df = df.rename(columns={'unpaid_amount': 'amount'})[self.EMPTY_COLS]
             logger.info(f"Extracted {len(df)} receivable items after filtering")
             return df
-
         except Exception as e:
             logger.error(f"Error extracting receivables: {e}")
-            return pd.DataFrame(columns=['company_name', 'due_date', 'amount', 'days_until_due'])
+            return pd.DataFrame(columns=self.EMPTY_COLS)
 
     def assign_to_weeks(self, items_df: pd.DataFrame, num_weeks: int = 13,
                        start_date: datetime = None) -> Tuple[Dict[str, float], List[Dict]]:
