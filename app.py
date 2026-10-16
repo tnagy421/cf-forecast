@@ -37,6 +37,11 @@ st.markdown("""
         background-color: #f0fdf4;
     }
 
+    .metric-card.balance {
+        border-left-color: #1f77b4;
+        background-color: #eff6ff;
+    }
+
     .metric-card.negative {
         border-left-color: #d62728;
         background-color: #fef2f2;
@@ -46,18 +51,19 @@ st.markdown("""
         font-size: 24px;
         font-weight: bold;
         margin: 10px 0;
+        color: #111827 !important;
     }
 
     .metric-label {
         font-size: 14px;
-        color: #666;
+        color: #374151 !important;
         text-transform: uppercase;
         font-weight: 600;
     }
 
     .metric-count {
         font-size: 12px;
-        color: #999;
+        color: #4b5563 !important;
         margin-top: 8px;
     }
 
@@ -81,6 +87,24 @@ if 'receivables_df' not in st.session_state:
     st.session_state.receivables_df = None
 
 
+def get_num_weeks(forecast):
+    """Number of weeks actually present in the forecast dict."""
+    return sum(1 for k in forecast if k.startswith('week_'))
+
+
+def detect_export_type(df):
+    """Return 'receivables', 'payables' or None based on the report title in A1."""
+    try:
+        title = str(df.iloc[0, 0]).lower()
+    except Exception:
+        return None
+    if 'pohľad' in title or 'pohlad' in title:
+        return 'receivables'
+    if 'záväz' in title or 'zavaz' in title:
+        return 'payables'
+    return None
+
+
 def format_currency(value):
     """Format value as currency."""
     return f"€ {value:,.2f}".replace(',', ' ')
@@ -98,7 +122,11 @@ def load_excel_file(uploaded_file):
 
 def create_summary_cards(summary):
     """Create summary metric cards."""
-    col1, col2, col3 = st.columns(3)
+    has_balance = bool(summary.get('opening_balance'))
+    if has_balance:
+        col1, col2, col3, col4 = st.columns(4)
+    else:
+        col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown(f"""
@@ -125,9 +153,21 @@ def create_summary_cards(summary):
             <div class="metric-card {net_class}">
                 <div class="metric-label">Net Cash Flow</div>
                 <div class="metric-value">{format_currency(net_value)}</div>
-                <div class="metric-count">13 weeks total</div>
+                <div class="metric-count">{summary.get('num_weeks', 13)} weeks total</div>
             </div>
         """, unsafe_allow_html=True)
+
+    if has_balance:
+        with col4:
+            closing = summary['closing_balance']
+            cls = "balance" if closing >= 0 else "negative"
+            st.markdown(f"""
+                <div class="metric-card {cls}">
+                    <div class="metric-label">Zostatok na konci</div>
+                    <div class="metric-value">{format_currency(closing)}</div>
+                    <div class="metric-count">začiatok: {format_currency(summary['opening_balance'])} · minimum: {format_currency(summary['min_closing_balance'])}</div>
+                </div>
+            """, unsafe_allow_html=True)
 
 
 def create_stacked_bar_chart(forecast):
@@ -136,7 +176,7 @@ def create_stacked_bar_chart(forecast):
     receivables = []
     payables = []
 
-    for i in range(1, 14):
+    for i in range(1, get_num_weeks(forecast) + 1):
         week_data = forecast[f'week_{i}']
         weeks.append(f"W{i}")
         receivables.append(week_data['receivables'])
@@ -166,7 +206,6 @@ def create_stacked_bar_chart(forecast):
         yaxis_title='Amount (€)',
         barmode='relative',
         hovermode='x unified',
-        template='plotly_white',
         height=400,
         margin=dict(b=50, l=50, r=20, t=50)
     )
@@ -174,20 +213,21 @@ def create_stacked_bar_chart(forecast):
     return fig
 
 
-def create_net_cf_chart(forecast):
+def create_net_cf_chart(forecast, opening_balance=0.0):
     """Create line chart: Net Cash Flow over 13 weeks."""
     weeks = []
     net_cf = []
     cumulative_cf = 0
     cumulative = []
+    show_balance = bool(opening_balance)
 
-    for i in range(1, 14):
+    for i in range(1, get_num_weeks(forecast) + 1):
         week_data = forecast[f'week_{i}']
         weeks.append(f"W{i}")
         net = week_data['net']
         net_cf.append(net)
         cumulative_cf += net
-        cumulative.append(cumulative_cf)
+        cumulative.append(week_data['closing'] if show_balance else cumulative_cf)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -209,22 +249,21 @@ def create_net_cf_chart(forecast):
         go.Scatter(
             x=weeks,
             y=cumulative,
-            name='Cumulative CF',
+            name='Account balance' if show_balance else 'Cumulative CF',
             line=dict(color='#ff7f0e', width=2, dash='dash'),
             marker=dict(size=6),
-            hovertemplate='<b>%{x}</b><br>Cumulative: %{y:,.2f} €<extra></extra>'
+            hovertemplate='<b>%{x}</b><br>Balance / cumulative: %{y:,.2f} €<extra></extra>'
         ),
         secondary_y=True
     )
 
     fig.update_xaxes(title_text="Week")
     fig.update_yaxes(title_text="Weekly Net CF (€)", secondary_y=False)
-    fig.update_yaxes(title_text="Cumulative CF (€)", secondary_y=True)
+    fig.update_yaxes(title_text="Account balance (€)" if show_balance else "Cumulative CF (€)", secondary_y=True)
 
     fig.update_layout(
         title='Net Cash Flow Trend',
         hovermode='x unified',
-        template='plotly_white',
         height=400,
         margin=dict(b=50, l=50, r=50, t=50)
     )
@@ -232,14 +271,18 @@ def create_net_cf_chart(forecast):
     return fig
 
 
-def create_waterfall_chart(forecast):
+def create_waterfall_chart(forecast, opening_balance=0.0):
     """Create waterfall chart showing cumulative impact."""
     weeks = []
     measures = []
     values = []
 
     cumulative = 0
-    for i in range(1, 14):
+    if opening_balance:
+        weeks.append('Start')
+        measures.append('absolute')
+        values.append(opening_balance)
+    for i in range(1, get_num_weeks(forecast) + 1):
         week_data = forecast[f'week_{i}']
         net = week_data['net']
         weeks.append(f"W{i}")
@@ -267,7 +310,6 @@ def create_waterfall_chart(forecast):
 
     fig.update_layout(
         title='Cumulative Cash Flow Impact (Waterfall)',
-        template='plotly_white',
         height=400,
         margin=dict(b=50, l=50, r=20, t=50)
     )
@@ -278,14 +320,15 @@ def create_waterfall_chart(forecast):
 def create_detail_table(forecast):
     """Create detailed week-by-week table."""
     data = []
-    for i in range(1, 14):
+    for i in range(1, get_num_weeks(forecast) + 1):
         week_data = forecast[f'week_{i}']
         data.append({
             'Week': f"W{i}",
             'Period': f"{week_data['week_start']} to {week_data['week_end']}",
             'Receivables': format_currency(week_data['receivables']),
             'Payables': format_currency(week_data['payables']),
-            'Net CF': format_currency(week_data['net'])
+            'Net CF': format_currency(week_data['net']),
+            'Closing balance': format_currency(week_data['closing'])
         })
 
     df_detail = pd.DataFrame(data)
@@ -319,7 +362,7 @@ def export_to_excel(forecast_data):
 
         # Forecast sheet
         forecast_data_list = []
-        for i in range(1, 14):
+        for i in range(1, get_num_weeks(forecast_data['forecast']) + 1):
             week_data = forecast_data['forecast'][f'week_{i}']
             forecast_data_list.append({
                 'Week': i,
@@ -327,7 +370,9 @@ def export_to_excel(forecast_data):
                 'End Date': week_data['week_end'],
                 'Receivables': week_data['receivables'],
                 'Payables': week_data['payables'],
-                'Net CF': week_data['net']
+                'Net CF': week_data['net'],
+                'Opening balance': week_data['opening'],
+                'Closing balance': week_data['closing']
             })
         forecast_df = pd.DataFrame(forecast_data_list)
         forecast_df.to_excel(writer, sheet_name='Forecast', index=False)
@@ -374,7 +419,7 @@ with st.sidebar:
     # Number of weeks
     num_weeks = st.slider(
         "Number of Weeks",
-        min_value=4,
+        min_value=1,
         max_value=26,
         value=13,
         help="Total weeks to forecast"
@@ -385,6 +430,14 @@ with st.sidebar:
         "Minimum Amount (EUR)",
         value=0.0,
         help="Exclude items below this amount"
+    )
+
+    # Optional bank balance
+    opening_balance = st.number_input(
+        "Aktuálny zostatok na účte (EUR) – voliteľné",
+        value=0.0,
+        step=1000.0,
+        help="Zostatok na bankovom účte ku dňu začiatku prognózy. Ak ho zadáte, uvidíte zostatok na konci každého týždňa. Nechajte 0, ak nechcete používať."
     )
 
     st.divider()
@@ -416,6 +469,11 @@ with st.sidebar:
                 payables_raw = load_excel_file(payables_file)
 
                 if receivables_raw is not None and payables_raw is not None:
+                    # Auto-correct swapped uploads (detected from the report title)
+                    if detect_export_type(receivables_raw) == 'payables' and detect_export_type(payables_raw) == 'receivables':
+                        receivables_raw, payables_raw = payables_raw, receivables_raw
+                        st.warning("⚠️ Súbory boli nahraté opačne – automaticky som ich prehodil.")
+
                     # Extract data
                     predictor = CashFlowPredictor(today=forecast_start_dt)
 
@@ -432,7 +490,8 @@ with st.sidebar:
                         payables_df,
                         receivables_df,
                         num_weeks=num_weeks,
-                        start_date=forecast_start_dt
+                        start_date=forecast_start_dt,
+                        opening_balance=opening_balance
                     )
 
                     # Cache in session state
@@ -476,13 +535,13 @@ if st.session_state.forecast_data:
 
     with tab2:
         st.plotly_chart(
-            create_net_cf_chart(forecast_data['forecast']),
+            create_net_cf_chart(forecast_data['forecast'], forecast_data['summary'].get('opening_balance', 0.0)),
             use_container_width=True
         )
 
     with tab3:
         st.plotly_chart(
-            create_waterfall_chart(forecast_data['forecast']),
+            create_waterfall_chart(forecast_data['forecast'], forecast_data['summary'].get('opening_balance', 0.0)),
             use_container_width=True
         )
 
@@ -541,9 +600,9 @@ if st.session_state.forecast_data:
     insights = []
 
     if net_total > 0:
-        insights.append(f"✅ **Positive Cash Flow**: Your 13-week forecast shows a net inflow of {format_currency(net_total)}")
+        insights.append(f"✅ **Positive Cash Flow**: Your {st.session_state.num_weeks}-week forecast shows a net inflow of {format_currency(net_total)}")
     else:
-        insights.append(f"⚠️ **Negative Cash Flow**: Your 13-week forecast shows a net outflow of {format_currency(abs(net_total))}")
+        insights.append(f"⚠️ **Negative Cash Flow**: Your {st.session_state.num_weeks}-week forecast shows a net outflow of {format_currency(abs(net_total))}")
 
     insights.append(f"📊 **Average Weekly**: {format_currency(avg_weekly)} per week")
 
@@ -555,6 +614,12 @@ if st.session_state.forecast_data:
 
     if negative_weeks:
         insights.append(f"⚠️ **Cash Flow Deficit Weeks**: Weeks {', '.join(map(str, negative_weeks))} show negative cash flow")
+
+    if summary.get('opening_balance'):
+        if summary['min_closing_balance'] < 0:
+            insights.append(f"🚨 **Zostatok na účte klesne pod nulu** – minimum {format_currency(summary['min_closing_balance'])}")
+        else:
+            insights.append(f"🏦 **Zostatok na konci obdobia**: {format_currency(summary['closing_balance'])} (minimum {format_currency(summary['min_closing_balance'])})")
 
     for insight in insights:
         st.info(insight)

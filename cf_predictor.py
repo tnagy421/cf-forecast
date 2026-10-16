@@ -175,15 +175,17 @@ class CashFlowPredictor:
         return weekly_amounts, details
 
     def generate_forecast(self, payables_df: pd.DataFrame, receivables_df: pd.DataFrame,
-                         num_weeks: int = 13, start_date: datetime = None) -> Dict:
+                         num_weeks: int = 13, start_date: datetime = None,
+                         opening_balance: float = 0.0) -> Dict:
         """
-        Generate complete 13-week cash flow forecast.
+        Generate complete cash flow forecast (1-26 weeks).
 
         Args:
             payables_df: DataFrame of unpaid payables from extract_payables()
             receivables_df: DataFrame of unpaid receivables from extract_receivables()
             num_weeks: Number of weeks in forecast
             start_date: Start date for forecast
+            opening_balance: Optional bank balance at the start (default 0)
 
         Returns:
             Dictionary with weekly summaries and details
@@ -199,6 +201,7 @@ class CashFlowPredictor:
 
         # Calculate net cash flow per week
         forecast = {}
+        running = float(opening_balance or 0.0)
         for i in range(1, num_weeks + 1):
             week_key = f"week_{i}"
             week_start = start_date + timedelta(days=7 * (i - 1))
@@ -207,6 +210,8 @@ class CashFlowPredictor:
             receivables = receivables_weekly.get(week_key, 0.0)
             payables = payables_weekly.get(week_key, 0.0)
             net = receivables - payables
+            opening = running
+            running += net
 
             forecast[week_key] = {
                 'week_num': i,
@@ -215,6 +220,8 @@ class CashFlowPredictor:
                 'receivables': round(receivables, 2),
                 'payables': round(payables, 2),
                 'net': round(net, 2),
+                'opening': round(opening, 2),
+                'closing': round(running, 2),
             }
 
         # Summary
@@ -230,6 +237,10 @@ class CashFlowPredictor:
                 'total_net': round(total_net, 2),
                 'num_receivables': len(receivables_detail),
                 'num_payables': len(payables_detail),
+                'num_weeks': num_weeks,
+                'opening_balance': round(float(opening_balance or 0.0), 2),
+                'closing_balance': round(running, 2),
+                'min_closing_balance': round(min(w['closing'] for w in forecast.values()), 2),
             },
             'receivables_detail': receivables_detail,
             'payables_detail': payables_detail,
@@ -257,8 +268,10 @@ class CashFlowPredictor:
             return f"€ {val:,.2f}".replace(',', ' ')
 
         # Build table rows
+        n = summary.get('num_weeks') or sum(1 for k in forecast if k.startswith('week_'))
+        has_bal = bool(summary.get('opening_balance'))
         table_rows = ""
-        for i in range(1, 14):
+        for i in range(1, n + 1):
             week_data = forecast[f'week_{i}']
             week_start = week_data['week_start']
             week_end = week_data['week_end']
@@ -269,6 +282,10 @@ class CashFlowPredictor:
             # Color code net based on positive/negative
             net_color = '#00aa00' if net >= 0 else '#cc0000'
 
+            closing = week_data['closing']
+            bal_cell = (f'<td class="col-amount" style="color: {"#00aa00" if closing >= 0 else "#cc0000"};'
+                        f' font-weight: bold;">{fmt_currency(closing)}</td>') if has_bal else ''
+
             table_rows += f"""
             <tr>
                 <td class="col-week">Týždeň {i}</td>
@@ -276,8 +293,14 @@ class CashFlowPredictor:
                 <td class="col-amount" style="color: #00aa00;">{fmt_currency(receivables)}</td>
                 <td class="col-amount" style="color: #cc0000;">{fmt_currency(-payables)}</td>
                 <td class="col-amount" style="color: {net_color}; font-weight: bold;">{fmt_currency(net)}</td>
+                {bal_cell}
             </tr>
             """
+
+        bal_head = '<th style="text-align: right;">Zostatok na konci týždňa</th>' if has_bal else ''
+        bal_box = (f'''<div class="summary-box net"><h3>Zostatok na účte (začiatok → koniec)</h3>
+                        <div class="value">{fmt_currency(summary['closing_balance'])}</div>
+                        <div class="count">začiatok: {fmt_currency(summary['opening_balance'])}</div></div>''') if has_bal else ''
 
         html = f"""
         <!DOCTYPE html>
@@ -285,7 +308,7 @@ class CashFlowPredictor:
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>13-Week Cash Flow Forecast</title>
+            <title>Cash Flow Forecast</title>
             <style>
                 * {{
                     margin: 0;
@@ -440,7 +463,7 @@ class CashFlowPredictor:
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>13-Week Rolling Cash Flow Forecast</h1>
+                    <h1>{n}-Week Rolling Cash Flow Forecast</h1>
                     <p>Forecast Period: {forecast_data['forecast_start']}</p>
                 </div>
 
@@ -458,8 +481,9 @@ class CashFlowPredictor:
                     <div class="summary-box net">
                         <h3>Čistý Cash Flow</h3>
                         <div class="value">{fmt_currency(summary['total_net'])}</div>
-                        <div class="count">13 weeks total</div>
+                        <div class="count">{n} weeks total</div>
                     </div>
+                    {bal_box}
                 </div>
 
                 <table>
@@ -470,6 +494,7 @@ class CashFlowPredictor:
                             <th style="text-align: right;">Pohľadávky</th>
                             <th style="text-align: right;">Záväzky</th>
                             <th style="text-align: right;">Čistý CF</th>
+                            {bal_head}
                         </tr>
                     </thead>
                     <tbody>
