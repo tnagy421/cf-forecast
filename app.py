@@ -13,6 +13,17 @@ from plotly.subplots import make_subplots
 
 from cf_predictor import CashFlowPredictor
 
+# ---- Version info (update on every release) ----
+APP_VERSION = "1.4.0"
+APP_UPDATED = "22.10.2026"
+CHANGELOG = [
+    ("1.4.0", "22.10.2026", "Mínusové položky (preplatky) sa započítavajú; Minimum Amount podľa absolútnej hodnoty"),
+    ("1.3.0", "16.10.2026", "Obdobie 1-26 týždňov, čitateľnosť v nočnom režime, voliteľný zostatok na účte"),
+    ("1.2.0", "21.09.2026", "Parser skutočného exportu (stĺpce podľa hlavičky, názov firmy), pravidlo 70 dní po splatnosti"),
+    ("1.1.0", "21.09.2026", "Oprava závislostí pre Streamlit Cloud"),
+    ("1.0.0", "21.09.2026", "Prvé nasadenie"),
+]
+
 # Page configuration
 st.set_page_config(
     page_title="13-Week Cash Flow Forecast",
@@ -429,7 +440,7 @@ with st.sidebar:
     min_amount = st.number_input(
         "Minimum Amount (EUR)",
         value=0.0,
-        help="Exclude items below this amount"
+        help="Vynechá položky, ktorých absolútna hodnota je menšia ako táto suma. Nechajte 0, aby sa započítali všetky položky (vrátane preplatkov/mínusových)."
     )
 
     # Optional bank balance
@@ -482,8 +493,9 @@ with st.sidebar:
 
                     # Apply minimum amount filter
                     if min_amount > 0:
-                        receivables_df = receivables_df[receivables_df['amount'] >= min_amount]
-                        payables_df = payables_df[payables_df['amount'] >= min_amount]
+                        # Compare absolute values so credits (negative items) are not lost
+                        receivables_df = receivables_df[receivables_df['amount'].abs() >= min_amount]
+                        payables_df = payables_df[payables_df['amount'].abs() >= min_amount]
 
                     # Generate forecast
                     forecast_data = predictor.generate_forecast(
@@ -505,6 +517,13 @@ with st.sidebar:
                     st.error("❌ Failed to load Excel files")
         else:
             st.error("❌ Please upload both receivables and payables files")
+
+with st.sidebar:
+    st.divider()
+    st.caption(f"Verzia **{APP_VERSION}** · posledná aktualizácia {APP_UPDATED}")
+    with st.expander("História zmien"):
+        for ver, dt, note in CHANGELOG:
+            st.markdown(f"**{ver}** ({dt}) – {note}")
 
 # Main content area
 if st.session_state.forecast_data:
